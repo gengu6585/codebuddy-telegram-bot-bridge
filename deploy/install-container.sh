@@ -22,7 +22,7 @@ echo "→ Syncing source to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 rsync -a --delete \
     --exclude '.git' --exclude 'venv' --exclude '.telegram_bot' \
-    --exclude '__pycache__' --exclude 'deploy/runtime' \
+    --exclude '__pycache__' \
     "$SRC_DIR/" "$INSTALL_DIR/"
 
 if [ ! -f "$INSTALL_DIR/deploy/runtime/bot.env" ]; then

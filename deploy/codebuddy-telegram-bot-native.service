@@ -1,0 +1,25 @@
+[Unit]
+Description=CodeBuddy Telegram Bot Bridge
+After=network-online.target docker.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/tinkerlab
+Environment="HOME=/root"
+Environment="PROJECT_ROOT=/workspace/tinkerlab"
+Environment="NODE_TLS_REJECT_UNAUTHORIZED=0"
+Environment="PATH=/opt/tinkerlab/codebuddy-telegram-bot-bridge/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/tinkerlab/codebuddy-telegram-bot-bridge/start.sh --path /workspace/tinkerlab --_daemon_supervisor
+ExecStop=/opt/tinkerlab/codebuddy-telegram-bot-bridge/start.sh --path /workspace/tinkerlab --stop
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
