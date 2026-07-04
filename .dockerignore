@@ -1,0 +1,14 @@
+.git
+.gitignore
+venv
+.venv
+__pycache__
+*.pyc
+.telegram_bot
+*.log
+logs
+.env
+deploy/runtime
+deploy/secrets
+.DS_Store
+docs/screenshots

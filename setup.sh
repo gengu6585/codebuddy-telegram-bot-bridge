@@ -150,29 +150,47 @@ check_python_version() {
     echo -e "${GREEN}✅ Python $PYTHON_VERSION${NC}"
 }
 
-check_claude_cli() {
-    echo -n "🔍 Checking Claude CLI... "
+check_codebuddy_cli() {
+    echo -n "🔍 Checking CodeBuddy CLI... "
 
-    if ! command -v claude &> /dev/null; then
-        echo -e "${RED}❌${NC}"
-        echo ""
-        echo -e "${RED}${BOLD}Claude CLI not found${NC}"
-        echo ""
-        echo "Claude CLI is required to run this bot. Please install it first:"
-        echo ""
-        echo -e "${BOLD}Option 1: Using npm (recommended)${NC}"
-        echo "  npm install -g @anthropic-ai/claude-code"
-        echo ""
-        echo -e "${BOLD}Option 2: Using Homebrew${NC}"
-        echo "  brew install anthropics/claude/claude"
-        echo ""
-        echo "After installation, make sure 'claude' is in your PATH, then run this script again."
-        echo ""
-        exit 1
+    if command -v codebuddy &> /dev/null; then
+        CODEBUDDY_VERSION=$(codebuddy --version 2>/dev/null || echo "unknown")
+        echo -e "${GREEN}✅ $CODEBUDDY_VERSION${NC}"
+        return
     fi
 
-    CLAUDE_VERSION=$(claude --version 2>/dev/null || echo "unknown")
-    echo -e "${GREEN}✅ $CLAUDE_VERSION${NC}"
+    # Migration fallback: if the user still has `claude` available, accept it
+    # so the existing setup can still finish. We will prompt them to install
+    # codebuddy afterwards.
+    if command -v claude &> /dev/null; then
+        echo -e "${YELLOW}⚠️  using legacy Claude CLI${NC}"
+        echo "    CodeBuddy CLI is preferred but claude is still functional."
+        echo "    Install CodeBuddy Code with: npm i -g @tencent-ai/codebuddy-code"
+        return
+    fi
+
+    echo -e "${RED}❌${NC}"
+    echo ""
+    echo -e "${RED}${BOLD}CodeBuddy CLI not found${NC}"
+    echo ""
+    echo "This bot uses Tencent CodeBuddy Code (codebuddy) as the AI backend."
+    echo "Please install it first:"
+    echo ""
+    echo -e "${BOLD}Option 1: Using npm (recommended)${NC}"
+    echo "  npm install -g @tencent-ai/codebuddy-code"
+    echo ""
+    echo -e "${BOLD}Option 2: Using Homebrew${NC}"
+    echo "  brew install tencent-ai/codebuddy/codebuddy"
+    echo ""
+    echo "After installation, make sure 'codebuddy' is in your PATH, then run this script again."
+    echo ""
+    echo "Alternatively, set CODEBUDDY_CLI_PATH in .env to an existing binary."
+    exit 1
+}
+
+# Backwards-compatible wrapper.
+check_claude_cli() {
+    check_codebuddy_cli
 }
 
 check_optional_deps() {

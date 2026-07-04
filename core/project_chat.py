@@ -4,6 +4,7 @@ Project Chat Handler - Integrates Telegram with Claude Code SDK.
 
 import os
 import re
+import shutil
 import asyncio
 import json
 import logging
@@ -33,28 +34,120 @@ logger = logging.getLogger(__name__)
 
 
 def _patch_sdk_cli_resolution() -> None:
-    """Make SDK default transport honor configured CLAUDE_CLI_PATH."""
+    """Make SDK default transport honor configured CLI path.
+
+    Defaults to the `codebuddy` binary on PATH (this bridge swaps Claude Code
+    for Tencent CodeBuddy Code). Honors CODEBUDDY_CLI_PATH / CLAUDE_CLI_PATH.
+    """
     marker = "_telegram_bot_cli_path_patch_applied"
     if getattr(SubprocessCLITransport, marker, False):
         return
-    if not config.claude_cli_path:
-        return
 
-    cli_path = str(config.claude_cli_path)
+    # Prefer the explicit codebuddy path; fall back to legacy CLAUDE_CLI_PATH
+    # so existing configs keep working during the migration.
+    configured = (
+        os.environ.get("CODEBUDDY_CLI_PATH")
+        or os.environ.get("CLAUDE_CLI_PATH")
+        or ""
+    ).strip()
+    if configured:
+        cli_path = configured
+    else:
+        # Default to `codebuddy` (Tencent CodeBuddy Code CLI). If missing the
+        # SDK's own _find_cli will raise CLINotFoundError, which we surface
+        # via the bot's readiness probe before the first chat call.
+        cli_path = shutil.which("codebuddy") or shutil.which("claude") or "codebuddy"
 
     def patched_find_cli(self):
         return cli_path
 
     setattr(SubprocessCLITransport, "_find_cli", patched_find_cli)
     setattr(SubprocessCLITransport, marker, True)
-    logger.info(f"Patched SDK CLI resolution to use configured path: {cli_path}")
+    logger.info(f"Patched SDK CLI resolution to use: {cli_path}")
+
+    # The SDK ships a bundled `claude` binary that `_find_bundled_cli` returns
+    # *before* `_find_cli` is even consulted. In a launchd / minimal env that
+    # binary often fails to start (missing libssl, ioreg, tty, etc.), so we
+    # disable it and force the patched codebuddy path.
+    def _no_bundled_cli(self):
+        return None
+
+    setattr(SubprocessCLITransport, "_find_bundled_cli", _no_bundled_cli)
+    logger.info("Disabled SDK's bundled claude binary to ensure codebuddy is used")
+
+    # The SDK auto-injects `--permission-prompt-tool stdio` to enable its
+    # control-protocol channel (client.py sets permission_prompt_tool_name).
+    # CodeBuddy Code doesn't recognize that flag and exits with code 1, so
+    # we strip it (and the value that follows) from the assembled argv.
+    if not getattr(SubprocessCLITransport, "_telegram_bot_cmd_filter_applied", False):
+
+        def _strip_unsupported_flags(cmd):
+            UNSUPPORTED = {
+                "--permission-prompt-tool",
+            }
+            out = []
+            skip_next = False
+            for tok in cmd:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if tok in UNSUPPORTED:
+                    skip_next = True  # also drop the value following the flag
+                    continue
+                out.append(tok)
+            return out
+
+        def _ensure_empty_mcp_config(cmd):
+            # The SDK's `if self._options.mcp_servers:` truthy check skips
+            # adding --mcp-config when callers pass an empty dict. Combined
+            # with --strict-mcp-config that leaves codebuddy with no MCP
+            # servers at all, which is what we want for the bridge — but
+            # we need the flag present so codebuddy honors strict mode.
+            if "--strict-mcp-config" in cmd and "--mcp-config" not in cmd:
+                cmd = list(cmd) + ["--mcp-config", '{"mcpServers":{}}']
+            return cmd
+
+        original_build_command = SubprocessCLITransport._build_command
+
+        def patched_build_command(self):
+            cmd = original_build_command(self)
+            cmd = _strip_unsupported_flags(cmd)
+            cmd = _ensure_empty_mcp_config(cmd)
+            return cmd
+
+        setattr(
+            SubprocessCLITransport,
+            "_build_command",
+            patched_build_command,
+        )
+        setattr(SubprocessCLITransport, "_telegram_bot_cmd_filter_applied", True)
+        logger.info("Patched SDK _build_command: drop unsupported flags + ensure empty --mcp-config under --strict-mcp-config")
+
+
+def _log_backend_stderr(line: str) -> None:
+    """Forward codebuddy's stderr lines into our logger.
+
+    The SDK only surfaces exit code by default; without this callback any
+    error from the underlying CLI is silently dropped. We log at WARNING so
+    transient prompts (e.g. permission dialogs) are visible without polluting
+    the info-level stream.
+    """
+    stripped = line.rstrip()
+    if stripped:
+        logger.warning(f"[codebuddy stderr] {stripped}")
 
 
 _patch_sdk_cli_resolution()
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"]).resolve()
 PROJECT_DIR_NAME = str(PROJECT_ROOT).replace("/", "-").replace("_", "-")
-CONVERSATIONS_DIR = Path.home() / ".claude" / "projects" / PROJECT_DIR_NAME
+# CodeBuddy Code stores per-project conversation logs under ~/.codebuddy/projects/
+# Override with CODEBUDDY_PROJECTS_DIR if you want logs elsewhere.
+_custom_projects_dir = os.environ.get("CODEBUDDY_PROJECTS_DIR")
+CONVERSATIONS_DIR = (
+    Path(_custom_projects_dir).expanduser() if _custom_projects_dir
+    else Path.home() / ".codebuddy" / "projects" / PROJECT_DIR_NAME
+)
 
 ALLOWED_TOOLS = [
     "Read",
@@ -316,6 +409,17 @@ class ProjectChatHandler:
             ),
             "can_use_tool": can_use_tool,
             "permission_mode": "default",
+            # Surface the underlying CLI's stderr to our logger so failures
+            # (auth errors, missing plugins, version mismatches, etc.) are
+            # diagnosable from bot.log instead of disappearing into /dev/null.
+            "stderr": _log_backend_stderr,
+            # Bridge-specific MCP isolation: ignore the user's
+            # ~/.codebuddy/mcp.json (which often points at unreachable
+            # intranet endpoints like mcpgw.knot.woa.com) and pass an empty
+            # MCP config instead. The user's own codebuddy TUI sessions
+            # still see the full MCP set — this only affects the bridge.
+            "mcp_servers": {},
+            "strict_mcp_config": True,
         }
         if model:
             # Normalize model name: ensure at most one [1M] suffix

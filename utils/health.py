@@ -50,6 +50,14 @@ class RuntimeHealthReporter:
                 "last_error": "",
                 "consecutive_failures": 0,
             },
+            "backend": {
+                "state": "degraded",
+                "last_ok_at": None,
+                "last_error_at": None,
+                "last_error": "",
+            },
+            # Legacy key — kept so older health.json consumers / dashboards
+            # continue to read existing snapshots unchanged.
             "claude": {
                 "state": "degraded",
                 "last_ok_at": None,
@@ -95,8 +103,8 @@ class RuntimeHealthReporter:
 
     def _recompute_service_locked(self) -> None:
         telegram_state = self._state["telegram"]["state"]
-        claude_state = self._state["claude"]["state"]
-        if telegram_state == "healthy" and claude_state == "healthy":
+        backend_state = self._state["backend"]["state"]
+        if telegram_state == "healthy" and backend_state == "healthy":
             self._state["service"]["state"] = "available"
             self._state["service"]["reason"] = ""
             return
@@ -105,9 +113,9 @@ class RuntimeHealthReporter:
         if telegram_state != "healthy":
             detail = self._state["telegram"].get("last_error") or "telegram unavailable"
             reasons.append(f"Telegram: {detail}")
-        if claude_state != "healthy":
-            detail = self._state["claude"].get("last_error") or "claude unavailable"
-            reasons.append(f"Claude: {detail}")
+        if backend_state != "healthy":
+            detail = self._state["backend"].get("last_error") or "codebuddy unavailable"
+            reasons.append(f"CodeBuddy: {detail}")
 
         self._state["service"]["state"] = "degraded"
         self._state["service"]["reason"] = "; ".join(reasons)
@@ -158,20 +166,34 @@ class RuntimeHealthReporter:
             self._recompute_service_locked()
             self._write_health_locked()
 
-    def record_claude_ok(self) -> None:
+    def record_backend_ok(self) -> None:
         with self._lock:
+            now = _utc_now_iso()
+            self._state["backend"]["state"] = "healthy"
+            self._state["backend"]["last_ok_at"] = now
+            # Mirror to the legacy "claude" key so existing dashboards keep working.
             self._state["claude"]["state"] = "healthy"
-            self._state["claude"]["last_ok_at"] = _utc_now_iso()
+            self._state["claude"]["last_ok_at"] = now
             self._recompute_service_locked()
             self._write_health_locked()
 
-    def record_claude_error(self, error: str) -> None:
+    def record_backend_error(self, error: str) -> None:
         with self._lock:
+            now = _utc_now_iso()
+            normalized = _normalize_reason(error)
+            self._state["backend"]["state"] = "degraded"
+            self._state["backend"]["last_error_at"] = now
+            self._state["backend"]["last_error"] = normalized
+            # Mirror to the legacy "claude" key so existing dashboards keep working.
             self._state["claude"]["state"] = "degraded"
-            self._state["claude"]["last_error_at"] = _utc_now_iso()
-            self._state["claude"]["last_error"] = _normalize_reason(error)
+            self._state["claude"]["last_error_at"] = now
+            self._state["claude"]["last_error"] = normalized
             self._recompute_service_locked()
             self._write_health_locked()
+
+    # Backwards-compatible aliases for older call sites and tests.
+    record_claude_ok = record_backend_ok
+    record_claude_error = record_backend_error
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

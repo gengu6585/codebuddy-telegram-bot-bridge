@@ -26,7 +26,23 @@ load_dotenv(
 
 LOGS_DIR = BOT_DATA_DIR / "logs"
 SESSION_STORE_PATH = BOT_DATA_DIR / "sessions.json"
+# Default settings.json locations. Claude Code used ~/.claude/settings.json;
+# this bridge now targets CodeBuddy Code which uses ~/.codebuddy/settings.json.
+# Both paths are honored at runtime — see resolve_settings_path() below.
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+CODEBUDDY_SETTINGS_PATH = Path.home() / ".codebuddy" / "settings.json"
+
+
+def resolve_settings_path() -> Path:
+    """Pick the first existing settings.json from codebuddy → claude → default.
+
+    Falls back to the codebuddy default so callers can rely on a writable path
+    even on a clean machine.
+    """
+    for candidate in (CODEBUDDY_SETTINGS_PATH, CLAUDE_SETTINGS_PATH):
+        if candidate.exists():
+            return candidate
+    return CODEBUDDY_SETTINGS_PATH
 
 
 class Config(BaseSettings):
@@ -39,12 +55,24 @@ class Config(BaseSettings):
         extra="ignore",
     )
 
+    # Backend CLI selection. This bridge defaults to Tencent CodeBuddy Code
+    # (`codebuddy` on PATH). CODEBUDDY_CLI_PATH wins when set, otherwise
+    # CLAUDE_CLI_PATH is honored for migration, otherwise auto-detected.
+    codebuddy_cli_path: Optional[Path] = Field(
+        default=None,
+        description="Optional absolute path to the codebuddy CLI binary (defaults to `codebuddy` on PATH).",
+    )
+    codebuddy_settings_path: Path = Field(
+        default=CODEBUDDY_SETTINGS_PATH,
+        description="Path to CodeBuddy Code settings.json (defaults to ~/.codebuddy/settings.json).",
+    )
+    # Legacy aliases — kept so older .env files and existing tests still work.
     claude_cli_path: Optional[Path] = Field(
         default=None,
-        description="Optional absolute path to Claude CLI binary (defaults to system PATH)",
+        description="DEPRECATED alias for CODEBUDDY_CLI_PATH.",
     )
     claude_settings_path: Path = Field(
-        default=CLAUDE_SETTINGS_PATH, description="Path to Claude Code settings.json"
+        default=CLAUDE_SETTINGS_PATH, description="DEPRECATED alias for codebuddy_settings_path."
     )
 
     # Telegram Bot

@@ -308,7 +308,7 @@ if not health_path.exists():
     print(line("Process", "alive", f"PID: {pid}"))
     print(line("Service", "degraded", "health missing"))
     print(line("Telegram", "degraded", "health missing"))
-    print(line("Claude", "degraded", "health missing"))
+    print(line("CodeBuddy", "degraded", "health missing"))
     raise SystemExit(0)
 
 try:
@@ -318,7 +318,7 @@ except Exception as exc:
     print(line("Process", "alive", f"PID: {pid}"))
     print(line("Service", "degraded", f"invalid health file: {exc}"))
     print(line("Telegram", "degraded", "health unreadable"))
-    print(line("Claude", "degraded", "health unreadable"))
+    print(line("CodeBuddy", "degraded", "health unreadable"))
     raise SystemExit(0)
 
 updated_at = parse_iso(data.get("updated_at"))
@@ -328,7 +328,8 @@ if updated_at is not None:
 
 service = data.get("service") or {}
 telegram = data.get("telegram") or {}
-claude = data.get("claude") or {}
+# Prefer the new "backend" key, fall back to legacy "claude" key.
+backend = data.get("backend") or data.get("claude") or {}
 
 if age_seconds is None or age_seconds > stale_seconds:
     detail = "health stale"
@@ -338,15 +339,15 @@ if age_seconds is None or age_seconds > stale_seconds:
     print(line("Process", "alive", f"PID: {pid}"))
     print(line("Service", "degraded", detail))
     print(line("Telegram", "degraded", detail))
-    print(line("Claude", "degraded", detail))
+    print(line("CodeBuddy", "degraded", detail))
     raise SystemExit(0)
 
 service_state = service.get("state") or "degraded"
 service_reason = service.get("reason") or ""
 telegram_state = telegram.get("state") or "degraded"
 telegram_reason = telegram.get("last_error") or ""
-claude_state = claude.get("state") or "degraded"
-claude_reason = claude.get("last_error") or ""
+backend_state = backend.get("state") or "degraded"
+backend_reason = backend.get("last_error") or ""
 
 icons = {
     "available": "🟢",
@@ -358,7 +359,7 @@ print(f"{icons.get(service_state, '🟡')} Bot status: {service_state}")
 print(line("Process", "alive", f"PID: {pid}"))
 print(line("Service", service_state, service_reason))
 print(line("Telegram", telegram_state, telegram_reason if telegram_state != "healthy" else ""))
-print(line("Claude", claude_state, claude_reason if claude_state != "healthy" else ""))
+print(line("CodeBuddy", backend_state, backend_reason if backend_state != "healthy" else ""))
 PY
 }
 
@@ -372,7 +373,7 @@ do_status() {
         print_component_status "Process" "dead" "no PID file"
         print_component_status "Service" "unavailable" "process not running"
         print_component_status "Telegram" "unavailable" "process not running"
-        print_component_status "Claude" "unavailable" "process not running"
+        print_component_status "CodeBuddy" "unavailable" "process not running"
         exit 0
     fi
     if kill -0 "$pid" 2>/dev/null; then
@@ -845,8 +846,15 @@ esac
 
 load_optional_env() {
     local env_cli
-    env_cli="$(read_env_with_fallback "CLAUDE_CLI_PATH")"
-    if [ -n "$env_cli" ] && [ -z "$CLAUDE_CLI_PATH" ]; then
+    # New name wins, fall back to legacy CLAUDE_CLI_PATH for migration.
+    env_cli="$(read_env_with_fallback "CODEBUDDY_CLI_PATH")"
+    if [ -z "$env_cli" ]; then
+        env_cli="$(read_env_with_fallback "CLAUDE_CLI_PATH")"
+    fi
+    if [ -n "$env_cli" ]; then
+        export CODEBUDDY_CLI_PATH="$env_cli"
+        # Also export the legacy var so the Python SDK shim picks it up
+        # regardless of which env var it consults first.
         export CLAUDE_CLI_PATH="$env_cli"
     fi
 
@@ -855,29 +863,53 @@ load_optional_env() {
     if [ -n "$proxy_url" ]; then
         export http_proxy="$proxy_url"
         export https_proxy="$proxy_url"
-        export all_proxy="$proxy_url"
-        export no_proxy="localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
-        echo "🌐 Proxy configured: $proxy_url"
+        # ALL_PROXY_URL is for SOCKS5 proxy used by some clients (e.g. for
+        # Telegram long-polling); falls back to the HTTP URL when unset.
+        local all_proxy_url
+        all_proxy_url="$(read_env_with_fallback "ALL_PROXY_URL")"
+        export all_proxy="${all_proxy_url:-$proxy_url}"
+        # Honor a no_proxy override, else fall back to a sensible default.
+        local no_proxy_value
+        no_proxy_value="$(read_env_with_fallback "no_proxy")"
+        export no_proxy="${no_proxy_value:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}"
+        echo "🌐 Proxy configured: $proxy_url (all_proxy=$all_proxy)"
+
+        # When a corporate TLS-inspecting proxy (e.g. iOA) re-signs upstream
+        # certs, Node's TLS handshake fails with SSL_ERROR_SYSCALL on
+        # api.codebuddy.io. The user's codebuddy TUI sets
+        # NODE_TLS_REJECT_UNAUTHORIZED=0 via ~/.codebuddy/settings.json; SDK
+        # subprocesses don't pick that up, so we export it here whenever a
+        # proxy is in use.
+        export NODE_TLS_REJECT_UNAUTHORIZED="${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
+        echo "🔓 TLS verification disabled (corporate proxy detected)"
     fi
 }
 
-maybe_setup_claude_cli() {
-    if [ -n "$CLAUDE_CLI_PATH" ]; then
-        echo "🛠️ Using user-specified CLAUDE_CLI_PATH: $CLAUDE_CLI_PATH"
+maybe_setup_backend_cli() {
+    if [ -n "$CODEBUDDY_CLI_PATH" ]; then
+        echo "🛠️ Using user-specified CODEBUDDY_CLI_PATH: $CODEBUDDY_CLI_PATH"
         return
     fi
 
-    if command -v claude >/dev/null 2>&1; then
-        echo "✅ Using system Claude CLI: $(command -v claude)"
+    if command -v codebuddy >/dev/null 2>&1; then
+        echo "✅ Using system CodeBuddy CLI: $(command -v codebuddy)"
+    elif command -v claude >/dev/null 2>&1; then
+        echo "✅ Falling back to Claude CLI: $(command -v claude)"
+        export CODEBUDDY_CLI_PATH="$(command -v claude)"
     else
-        echo "❌ Error: claude command not found. Please install Claude CLI or set CLAUDE_CLI_PATH in .env"
+        echo "❌ Error: codebuddy command not found. Install CodeBuddy Code or set CODEBUDDY_CLI_PATH in .env"
         exit 1
     fi
 }
 
+# Backwards-compatible alias (older code paths may still call this name).
+maybe_setup_claude_cli() {
+    maybe_setup_backend_cli
+}
+
 prepare_runtime() {
     load_optional_env
-    maybe_setup_claude_cli
+    maybe_setup_backend_cli
 
     if ! command -v python3 >/dev/null 2>&1; then
         echo "❌ Error: Python 3.11+ is required"

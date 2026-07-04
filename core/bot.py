@@ -36,7 +36,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import BaseRequest, HTTPXRequest
-from telegram_bot.utils.config import config
+from telegram_bot.utils.config import config, resolve_settings_path
 from telegram_bot.session.manager import session_manager
 from telegram_bot.core.project_chat import (
     project_chat_handler,
@@ -91,12 +91,13 @@ class TelegramBot:
         self._volcengine_tos_uploader: Optional[VolcengineTOSUploader] = None
         self._tts_synthesizer: Optional[MacOSTtsSynthesizer] = None
 
-    # Available models for /model command (aliases, CLI resolves via env vars)
-    MODELS = [
-        ("sonnet", "Claude Sonnet"),
-        ("opus", "Claude Opus"),
-        ("haiku", "Claude Haiku"),
-    ]
+    # Available models for /model command.
+    # Resolved dynamically by `available_models()` from BOT_KNOWN_MODELS env
+    # var (comma-separated full model IDs); falls back to a sensible default
+    # that includes the Tencent iOA model used by default in this workspace.
+    DEFAULT_MODELS = (
+        "minimax-m3-ioa",
+    )
     _PATH_GUARDED_TOOLS = {"Read", "Edit", "Write", "MultiEdit", "Glob", "Grep", "Bash"}
     _ALLOW_OUTSIDE_ONCE_TOKEN = "ALLOW_OUTSIDE_ONCE"
     _DENY_OUTSIDE_TOKEN = "DENY_OUTSIDE"
@@ -189,39 +190,49 @@ class TelegramBot:
             health_reporter.mark_unavailable(exit_reason)
             health_reporter.cleanup_runtime_files()
 
-    def _probe_claude_readiness(self) -> tuple[bool, str]:
+    def _probe_backend_readiness(self) -> tuple[bool, str]:
+        """Probe whether the backend CLI (codebuddy by default) is usable.
+
+        CodeBuddy's `auth status` is an interactive TUI command and doesn't
+        accept --json, so we instead verify the binary responds to --version
+        and that a settings.json exists. Authentication is validated lazily
+        on the first chat call, which surfaces a clearer error to the user.
+        """
         cli_path = (
-            str(config.claude_cli_path)
-            if config.claude_cli_path
-            else shutil.which("claude") or ""
+            str(config.codebuddy_cli_path or config.claude_cli_path)
+            if (config.codebuddy_cli_path or config.claude_cli_path)
+            else (shutil.which("codebuddy") or shutil.which("claude") or "")
         )
         if not cli_path:
-            return False, "claude command not found"
+            return False, "codebuddy command not found"
 
         try:
             proc = subprocess.run(
-                [cli_path, "auth", "status", "--json"],
+                [cli_path, "--version"],
                 text=True,
                 capture_output=True,
                 timeout=5,
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return False, "claude auth status timed out"
+            return False, "codebuddy --version timed out"
         except Exception as exc:
-            return False, f"claude auth status failed: {exc}"
+            return False, f"codebuddy --version failed: {exc}"
 
-        raw = (proc.stdout or "").strip() or (proc.stderr or "").strip()
-        try:
-            data = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            preview = raw.replace("\n", " ")[:200]
-            return False, f"invalid claude auth response: {preview}"
+        if proc.returncode != 0:
+            preview = ((proc.stderr or proc.stdout or "").replace("\n", " "))[:200]
+            return False, f"codebuddy --version failed (exit {proc.returncode}): {preview}"
 
-        if data.get("loggedIn") is True:
-            return True, ""
+        # Best-effort check that the user has a settings.json configured.
+        # A missing file is non-fatal: codebuddy will use built-in defaults.
+        settings_path = resolve_settings_path()
+        if not settings_path.exists():
+            return True, f"codebuddy OK (no settings.json at {settings_path})"
 
-        return False, "claude authentication unavailable"
+        return True, ""
+
+    # Backwards-compatible alias for existing call sites.
+    _probe_claude_readiness = _probe_backend_readiness
 
     async def _run_async(self):
         """Async entry: manage Application lifecycle and polling restart loop."""
@@ -297,11 +308,11 @@ class TelegramBot:
 
                 logger.info("Bot is running")
                 health_reporter.record_telegram_ok()
-                claude_ready, claude_reason = self._probe_claude_readiness()
-                if claude_ready:
-                    health_reporter.record_claude_ok()
+                backend_ready, backend_reason = self._probe_backend_readiness()
+                if backend_ready:
+                    health_reporter.record_backend_ok()
                 else:
-                    health_reporter.record_claude_error(claude_reason)
+                    health_reporter.record_backend_error(backend_reason)
 
                 watchdog_task = asyncio.create_task(self._polling_watchdog(stop_event))
 
@@ -862,7 +873,7 @@ class TelegramBot:
 
         # Sync session model with settings.json; clear if settings changed
         try:
-            with open(config.claude_settings_path, "r") as f:
+            with open(resolve_settings_path(), "r") as f:
                 settings_model = json.load(f).get("model")
         except Exception:
             settings_model = None
@@ -887,11 +898,11 @@ class TelegramBot:
         log_debug(user_id, "bot", reply)
 
     def _get_real_model(self, session: dict) -> str:
-        """Get current model from session or ~/.claude/settings.json"""
+        """Get current model from session or the resolved codebuddy settings.json."""
         if model := session.get("model"):
             return model
         try:
-            with open(config.claude_settings_path, "r") as f:
+            with open(resolve_settings_path(), "r") as f:
                 return json.load(f).get("model", "sonnet")
         except Exception:
             return "sonnet"
@@ -908,7 +919,8 @@ class TelegramBot:
             name = context.args[0]
             session["model"] = name
             await session_manager.update_session(user_id, session)
-            label = dict(self.MODELS).get(name, name)
+            available = self.available_models()
+            label = name if name in available else name
             logger.info(f"User {user_id}: model set to {name!r} via /model command")
             reply = f"✅ Switched to {label}"
             await message.reply_text(reply)
@@ -916,21 +928,59 @@ class TelegramBot:
             return
 
         current_model = self._get_real_model(session)
-        models = list(self.MODELS)
-        if current_model not in dict(models):
-            models.append((current_model, current_model))
+        available = self.available_models()
+        if current_model not in available:
+            available = list(available) + [current_model]
         buttons = [
             [
                 InlineKeyboardButton(
-                    f"{label} (current)" if name == current_model else label,
+                    f"{name} (current)" if name == current_model else name,
                     callback_data=f"model:{name}",
                 )
             ]
-            for name, label in models
+            for name in available
         ]
-        reply = "🤖 Select Claude Code model:"
+        reply = "🤖 Select model (full IDs):"
         await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
         log_debug(user_id, "bot", reply)
+
+    def available_models(self) -> tuple[str, ...]:
+        """Return the list of model IDs offered in the /model picker.
+
+        Reads BOT_KNOWN_MODELS from .env (comma-separated full model IDs);
+        falls back to DEFAULT_MODELS when unset or empty. Whitespace is
+        stripped; empty entries and duplicates are dropped while preserving
+        the configured order.
+        """
+        raw = os.environ.get("BOT_KNOWN_MODELS", "").strip()
+        if raw:
+            seen = set()
+            out: list[str] = []
+            for tok in raw.split(","):
+                name = tok.strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                out.append(name)
+            if out:
+                return tuple(out)
+        return self.DEFAULT_MODELS
+
+    async def _model_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline button taps from /model (callback_data=model:<id>)."""
+        query = update.callback_query
+        await query.answer()
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        if not query.data or not query.data.startswith("model:"):
+            return
+        name = query.data[len("model:"):]
+        session = await session_manager.get_session(user_id)
+        session["model"] = name
+        await session_manager.update_session(user_id, session)
+        logger.info(f"User {user_id}: model set to {name!r} via /model button")
+        await query.edit_message_text(f"✅ Switched to {name}")
 
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
@@ -2858,11 +2908,10 @@ class TelegramBot:
             session = await session_manager.get_session(user_id)
             session["model"] = model_name
             await session_manager.update_session(user_id, session)
-            label = dict(self.MODELS).get(model_name, model_name)
             logger.info(
                 f"User {user_id}: model set to {model_name!r} via inline keyboard"
             )
-            reply = f"✅ Model switched to: {label}"
+            reply = f"✅ Model switched to: {model_name}"
             await query.edit_message_text(reply)
             log_debug(user_id, "bot", reply)
             return
