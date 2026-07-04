@@ -42,9 +42,15 @@ cp "$INSTALL_DIR/deploy/runtime/bot.env" "$INSTALL_DIR/.env"
 mkdir -p "$WORKSPACE/.telegram_bot"
 cp "$INSTALL_DIR/deploy/runtime/bot.env" "$WORKSPACE/.telegram_bot/.env"
 
-echo "→ Installing CodeBuddy config"
+echo "→ CodeBuddy config"
 mkdir -p /root/.codebuddy
-rsync -a "$INSTALL_DIR/deploy/runtime/codebuddy/" /root/.codebuddy/
+if [ -f /root/.codebuddy/settings.json ]; then
+    echo "   keeping existing /root/.codebuddy (already configured)"
+elif [ -d "$INSTALL_DIR/deploy/runtime/codebuddy" ] && [ -n "$(ls -A "$INSTALL_DIR/deploy/runtime/codebuddy" 2>/dev/null)" ]; then
+    rsync -a "$INSTALL_DIR/deploy/runtime/codebuddy/" /root/.codebuddy/
+else
+    echo "   no bundled codebuddy config; ensure codebuddy auth is configured"
+fi
 
 echo "→ Python venv + dependencies"
 python3.11 -m venv "$INSTALL_DIR/venv"
