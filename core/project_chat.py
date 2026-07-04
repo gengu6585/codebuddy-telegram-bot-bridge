@@ -408,7 +408,10 @@ class ProjectChatHandler:
                 "in your response so the system can send it to the user."
             ),
             "can_use_tool": can_use_tool,
-            "permission_mode": "default",
+            # Bridge runs headless, no TTY for codebuddy to render its own
+            # permission prompts. The bot's can_use_tool callback is the
+            # single source of truth for permission decisions.
+            "permission_mode": "bypassPermissions",
             # Surface the underlying CLI's stderr to our logger so failures
             # (auth errors, missing plugins, version mismatches, etc.) are
             # diagnosable from bot.log instead of disappearing into /dev/null.

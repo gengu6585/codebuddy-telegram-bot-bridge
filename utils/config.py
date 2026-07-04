@@ -447,8 +447,11 @@ def setup_logging() -> None:
     # File handler - write to project-root scoped runtime logs.
     logs_dir = config.logs_dir
     logs_dir.mkdir(parents=True, exist_ok=True)
-    # Always write to file, not just in debug mode
-    fh = logging.FileHandler(logs_dir / "bot.log", encoding="utf-8")
+    # Always write to file, not just in debug mode.
+    # Unbuffered + immediate flush: under launchd there is no controlling
+    # TTY, so the default 8KB FileHandler buffer hides all activity until
+    # process exit. With buffer=1 the bot.log reflects live state.
+    fh = logging.FileHandler(logs_dir / "bot.log", encoding="utf-8", delay=False)
     fh.setLevel(log_level)
     fh.setFormatter(formatter)
     logging.getLogger().addHandler(fh)
@@ -464,7 +467,7 @@ def setup_logging() -> None:
     from datetime import datetime
 
     err_path = logs_dir / f"error_{datetime.now().strftime('%Y-%m-%d')}.log"
-    efh = logging.FileHandler(err_path, encoding="utf-8")
+    efh = logging.FileHandler(err_path, encoding="utf-8", delay=False)
     efh.setLevel(logging.ERROR)
     sep = "=" * 60
     efh.setFormatter(
