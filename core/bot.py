@@ -36,7 +36,11 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import BaseRequest, HTTPXRequest
-from telegram_bot.utils.config import config, resolve_settings_path
+from telegram_bot.utils.config import PROJECT_ROOT, config, resolve_settings_path
+from telegram_bot.utils.codebuddy_models import (
+    DEFAULT_MODELS,
+    resolve_available_models,
+)
 from telegram_bot.session.manager import session_manager
 from telegram_bot.core.project_chat import (
     project_chat_handler,
@@ -90,14 +94,10 @@ class TelegramBot:
         self._volcengine_transcriber: Optional[VolcengineFileFastTranscriber] = None
         self._volcengine_tos_uploader: Optional[VolcengineTOSUploader] = None
         self._tts_synthesizer: Optional[MacOSTtsSynthesizer] = None
+        self._model_labels: Dict[str, str] = {}
 
-    # Available models for /model command.
-    # Resolved dynamically by `available_models()` from BOT_KNOWN_MODELS env
-    # var (comma-separated full model IDs); falls back to a sensible default
-    # that includes the Tencent iOA model used by default in this workspace.
-    DEFAULT_MODELS = (
-        "minimax-m3-ioa",
-    )
+    # Fallback when CodeBuddy cache and BOT_KNOWN_MODELS are both unavailable.
+    DEFAULT_MODELS = DEFAULT_MODELS
     _PATH_GUARDED_TOOLS = {"Read", "Edit", "Write", "MultiEdit", "Glob", "Grep", "Bash"}
     _ALLOW_OUTSIDE_ONCE_TOKEN = "ALLOW_OUTSIDE_ONCE"
     _DENY_OUTSIDE_TOKEN = "DENY_OUTSIDE"
@@ -931,40 +931,37 @@ class TelegramBot:
         available = self.available_models()
         if current_model not in available:
             available = list(available) + [current_model]
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    f"{name} (current)" if name == current_model else name,
-                    callback_data=f"model:{name}",
-                )
-            ]
-            for name in available
-        ]
-        reply = "🤖 Select model (full IDs):"
+        buttons = []
+        for model_id in available:
+            label = self._model_display_name(model_id)
+            text = f"{label} (current)" if model_id == current_model else label
+            buttons.append(
+                [InlineKeyboardButton(text, callback_data=f"model:{model_id}")]
+            )
+        reply = f"🤖 Select model ({len(available)} available):"
         await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
         log_debug(user_id, "bot", reply)
 
-    def available_models(self) -> tuple[str, ...]:
-        """Return the list of model IDs offered in the /model picker.
+    def _model_display_name(self, model_id: str) -> str:
+        label = self._model_labels.get(model_id)
+        if label and label != model_id:
+            return f"{label} ({model_id})"
+        return model_id
 
-        Reads BOT_KNOWN_MODELS from .env (comma-separated full model IDs);
-        falls back to DEFAULT_MODELS when unset or empty. Whitespace is
-        stripped; empty entries and duplicates are dropped while preserving
-        the configured order.
+    def available_models(self) -> tuple[str, ...]:
+        """Return model IDs for the /model picker.
+
+        Prefers the CodeBuddy enterprise cache in ~/.codebuddy/local_storage.
+        BOT_KNOWN_MODELS acts as an optional allowlist when discovery succeeds.
         """
-        raw = os.environ.get("BOT_KNOWN_MODELS", "").strip()
-        if raw:
-            seen = set()
-            out: list[str] = []
-            for tok in raw.split(","):
-                name = tok.strip()
-                if not name or name in seen:
-                    continue
-                seen.add(name)
-                out.append(name)
-            if out:
-                return tuple(out)
-        return self.DEFAULT_MODELS
+        models, labels = resolve_available_models(
+            env_models=os.environ.get("BOT_KNOWN_MODELS", "").strip() or None,
+            codebuddy_home=config.codebuddy_settings_path.parent,
+            project_root=PROJECT_ROOT,
+            default_models=self.DEFAULT_MODELS,
+        )
+        self._model_labels = labels
+        return models
 
     async def _model_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline button taps from /model (callback_data=model:<id>)."""
